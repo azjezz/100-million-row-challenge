@@ -8,43 +8,37 @@ use function array_fill;
 use function asort;
 use function fclose;
 use function fgets;
+use function file_get_contents;
+use function file_put_contents;
 use function filesize;
 use function fopen;
 use function fread;
 use function fseek;
 use function ftell;
 use function fwrite;
-use function getenv;
-use function ord;
 use function pack;
 use function pcntl_fork;
 use function pcntl_waitpid;
-use function stream_get_contents;
 use function stream_set_read_buffer;
 use function stream_set_write_buffer;
-use function stream_socket_pair;
 use function strlen;
 use function strpos;
 use function strrpos;
 use function substr;
+use function unlink;
 use function unpack;
 
 use const SEEK_CUR;
-use const STREAM_IPPROTO_IP;
-use const STREAM_PF_UNIX;
-use const STREAM_SOCK_STREAM;
 
 final readonly class Parser
 {
     public function parse(string $inputPath, string $outputPath): void
     {
-        $workers = 4;
+        $workers = 8;
         $fileSize = filesize($inputPath);
         $chunkSize = (int) ($fileSize / $workers);
 
-        // 25 -> prefix
-        // 4 -> "uses" - shortest slug in dataset
-        // 26 -> date suffix
+        // 25 -> prefix, 4 -> "uses" shortest slug, 26 -> date suffix
         $safeSkip = 55;
         if (($fileSize % 100_000_000) === 0) {
             $safeSkip = (int) ($fileSize / 100_000_000) - 1;
@@ -69,7 +63,7 @@ final readonly class Parser
         $pathIds = [];
         $paths = [];
         $pathCount = 0;
-        $dateIds = array_fill(0, 4096, -1);
+        $dateIds = [];
         $dates = [];
         $dateCount = 0;
         $warmUpCounts = [];
@@ -85,16 +79,13 @@ final readonly class Parser
                 $pathCount++;
             }
 
-            $dateKey =
-                ((ord($chunk[$nlPos - 22]) - 48) << 9)
-                | ((((ord($chunk[$nlPos - 20]) - 48) * 10) + ord($chunk[$nlPos - 19]) - 48) << 5)
-                | (((ord($chunk[$nlPos - 17]) - 48) * 10) + ord($chunk[$nlPos - 16]) - 48);
-            $dateId = $dateIds[$dateKey];
+            $date = substr($chunk, $nlPos - 25, 10);
+            $dateId = $dateIds[$date] ?? -1;
 
             if ($dateId === -1) {
                 $dateId = $dateCount;
-                $dateIds[$dateKey] = $dateId;
-                $dates[$dateCount] = substr($chunk, $nlPos - 23, 8);
+                $dateIds[$date] = $dateId;
+                $dates[$dateCount] = $date;
                 $dateCount++;
             }
 
@@ -133,14 +124,16 @@ final readonly class Parser
             }
         }
 
-        $pipes = [];
+        $tmpDir = sys_get_temp_dir();
+        $myPid = getmypid();
+        $tmpFiles = [];
         $pids = [];
         for ($i = 0; $i < ($workers - 1); $i++) {
-            $pair = stream_socket_pair(STREAM_PF_UNIX, STREAM_SOCK_STREAM, STREAM_IPPROTO_IP);
+            $tmpFile = $tmpDir . '/parse_' . $myPid . '_' . $i;
+            $tmpFiles[$i] = $tmpFile;
             $pid = pcntl_fork();
 
             if ($pid === 0) {
-                fclose($pair[0]);
                 $data = self::processChunk(
                     $inputPath,
                     $boundaries[$i],
@@ -152,21 +145,10 @@ final readonly class Parser
                     $quickPath,
                     $safeSkip,
                 );
-                $binary = pack('V*', ...$data);
-                $len = strlen($binary);
-                $written = 0;
-
-                while ($written < $len) {
-                    $w = fwrite($pair[1], substr($binary, $written, 65536));
-                    $written += $w;
-                }
-
-                fclose($pair[1]);
+                file_put_contents($tmpFile, pack('V*', ...$data));
                 exit(0);
             }
 
-            fclose($pair[1]);
-            $pipes[$i] = $pair[0];
             $pids[$i] = $pid;
         }
 
@@ -182,13 +164,16 @@ final readonly class Parser
             $safeSkip,
         );
 
+        foreach ($pids as $pid) {
+            pcntl_waitpid($pid, $status);
+        }
+
         $total = $pathCount * $dateCount;
         $mergedCounts = $warmUpFlat;
         unset($warmUpFlat);
-        foreach ($pipes as $i => $pipe) {
-            $wCounts = unpack('V*', stream_get_contents($pipe));
-            fclose($pipe);
-            pcntl_waitpid($pids[$i], $status);
+        foreach ($tmpFiles as $tmpFile) {
+            $wCounts = unpack('V*', file_get_contents($tmpFile));
+            unlink($tmpFile);
 
             $j = 0;
             foreach ($wCounts as $v) {
@@ -220,7 +205,7 @@ final readonly class Parser
                     continue;
                 }
 
-                $entries[] = "        \"20{$dateStr}\": {$count}";
+                $entries[] = "        \"{$dateStr}\": {$count}";
             }
 
             $pathBuffer .= "\n" . implode(",\n", $entries) . "\n    }";
@@ -283,15 +268,11 @@ final readonly class Parser
                     }
                 }
 
-                $dateKey =
-                    ((ord($chunk[$nlPos - 22]) - 48) << 9)
-                    | ((((ord($chunk[$nlPos - 20]) - 48) * 10) + ord($chunk[$nlPos - 19]) - 48) << 5)
-                    | (((ord($chunk[$nlPos - 17]) - 48) * 10) + ord($chunk[$nlPos - 16]) - 48);
-
-                $dateId = $dateIds[$dateKey];
+                $date = substr($chunk, $nlPos - 25, 10);
+                $dateId = $dateIds[$date] ?? -1;
                 if ($dateId === -1) {
                     $dateId = $dateCount;
-                    $dateIds[$dateKey] = $dateId;
+                    $dateIds[$date] = $dateId;
                     $newStride = $stride + 1;
                     $newCounts = array_fill(0, $pathCount * $newStride, 0);
                     for ($j = 0; $j < $pathCount; $j++) {
