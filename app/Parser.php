@@ -61,6 +61,7 @@ final readonly class Parser
         $paths = [];
         $pathCount = 0;
         $dateIds = [];
+        $dateIds7 = [];
         $dates = [];
         $dateCount = 0;
         $warmUpCounts = [];
@@ -82,6 +83,7 @@ final readonly class Parser
             if ($dateId === -1) {
                 $dateId = $dateCount;
                 $dateIds[$date] = $dateId;
+                $dateIds7[substr($date, 3, 7)] = $dateId;
                 $dates[$dateCount] = $date;
                 $dateCount++;
             }
@@ -129,8 +131,7 @@ final readonly class Parser
                     $boundaries[$w],
                     $boundaries[$w + 1],
                     $pathBases,
-                    $dateIds,
-                    $safeSkip,
+                    $dateIds7,
                     $outputSize,
                 );
                 fwrite($pair[1], $output);
@@ -214,7 +215,6 @@ final readonly class Parser
         int $end,
         array $pathBases,
         array $dateIds,
-        int $safeSkip,
         int $outputSize,
     ): string {
         $counts = str_repeat("\0", $outputSize);
@@ -244,12 +244,13 @@ final readonly class Parser
             $pos = 0;
 
             while ($pos < $lastNl) {
-                $nlPos = strpos($chunk, "\n", $pos + $safeSkip);
+                $p = $pos + 25;
+                $c = strpos($chunk, ',', $p);
                 $idx =
-                    $pathBases[substr($chunk, $pos + 25, $nlPos - $pos - 51)]
-                    + $dateIds[substr($chunk, $nlPos - 25, 10)];
+                    $pathBases[substr($chunk, $p, $c - $p)]
+                    + $dateIds[substr($chunk, $c + 4, 7)];
                 $counts[$idx] = $inc[$counts[$idx]];
-                $pos = $nlPos + 1;
+                $pos = $c + 27;
             }
         }
 
