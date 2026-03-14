@@ -32,7 +32,7 @@ final readonly class Parser
     public static function parse(string $inputPath, string $outputPath): void
     {
         gc_disable();
-        $workers = 16;
+        $workers = 10;
         $fileSize = filesize($inputPath);
         $chunkSize = (int) ($fileSize / $workers);
 
@@ -173,7 +173,8 @@ final readonly class Parser
 
                     while ($p < $limit) {
                         $c = strpos($chunk, ',', $p);
-                        $idx = ($fast[$c - $p][$chunk[$p]][$chunk[$c - 1]] ?? $pathBases[substr($chunk, $p, $c - $p)])
+                        $idx =
+                            ($fast[$c - $p][$chunk[$p]][$chunk[$c - 1]] ?? $pathBases[substr($chunk, $p, $c - $p)])
                             + $dateIds7[substr($chunk, $c + 4, 7)];
                         $cnts[$idx] = $inc[$cnts[$idx]];
                         $p = $c + 52;
