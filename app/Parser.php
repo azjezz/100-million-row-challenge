@@ -241,16 +241,16 @@ final readonly class Parser
                 $remaining += $excess;
             }
 
-            $pos = 0;
+            $p = 25;
+            $limit = $lastNl + 25;
 
-            while ($pos < $lastNl) {
-                $p = $pos + 25;
+            while ($p < $limit) {
                 $c = strpos($chunk, ',', $p);
                 $idx =
                     $pathBases[substr($chunk, $p, $c - $p)]
                     + $dateIds[substr($chunk, $c + 4, 7)];
                 $counts[$idx] = $inc[$counts[$idx]];
-                $pos = $c + 27;
+                $p = $c + 52;
             }
         }
 
