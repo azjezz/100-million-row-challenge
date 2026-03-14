@@ -107,6 +107,22 @@ final readonly class Parser
             $pathBases[$path] = $id * $stride;
         }
 
+        $fast = [];
+        $conflict = [];
+        foreach ($pathBases as $slug => $base) {
+            $l = strlen($slug);
+            $f = $slug[0];
+            $la = $slug[$l - 1];
+            if (isset($conflict[$l][$f][$la])) {
+            } elseif (isset($fast[$l][$f][$la])) {
+                $conflict[$l][$f][$la] = true;
+                unset($fast[$l][$f][$la]);
+            } else {
+                $fast[$l][$f][$la] = $base;
+            }
+        }
+        unset($conflict);
+
         $total = $pathCount * $stride;
         $outputSize = $total;
 
@@ -126,15 +142,46 @@ final readonly class Parser
             stream_set_chunk_size($pair[1], $outputSize);
             if (pcntl_fork() === 0) {
                 fclose($pair[0]);
-                $output = self::processChunk(
-                    $inputPath,
-                    $boundaries[$w],
-                    $boundaries[$w + 1],
-                    $pathBases,
-                    $dateIds7,
-                    $outputSize,
-                );
-                fwrite($pair[1], $output);
+
+                // Inlined processChunk
+                $cnts = str_repeat("\0", $outputSize);
+                $inc = [];
+                for ($i = 0; $i < 255; $i++) {
+                    $inc[chr($i)] = chr($i + 1);
+                }
+
+                $h = fopen($inputPath, 'rb');
+                stream_set_read_buffer($h, 0);
+                fseek($h, $boundaries[$w]);
+
+                $remaining = $boundaries[$w + 1] - $boundaries[$w];
+
+                while ($remaining > 0) {
+                    $chunk = fread($h, $remaining > 33_554_432 ? 33_554_432 : $remaining);
+                    $chunkLen = strlen($chunk);
+                    $remaining -= $chunkLen;
+
+                    $lastNl = strrpos($chunk, "\n");
+                    if ($lastNl < ($chunkLen - 1)) {
+                        $excess = $chunkLen - $lastNl - 1;
+                        fseek($h, -$excess, SEEK_CUR);
+                        $remaining += $excess;
+                    }
+
+                    $p = 25;
+                    $limit = $lastNl + 25;
+
+                    while ($p < $limit) {
+                        $c = strpos($chunk, ',', $p);
+                        $idx = ($fast[$c - $p][$chunk[$p]][$chunk[$c - 1]] ?? $pathBases[substr($chunk, $p, $c - $p)])
+                            + $dateIds7[substr($chunk, $c + 4, 7)];
+                        $cnts[$idx] = $inc[$cnts[$idx]];
+                        $p = $c + 52;
+                    }
+                }
+
+                fclose($h);
+                fwrite($pair[1], $cnts);
                 exit(0);
             }
             fclose($pair[1]);
@@ -207,55 +254,5 @@ final readonly class Parser
 
         fwrite($out, "\n}");
         fclose($out);
-    }
-
-    private static function processChunk(
-        string $inputPath,
-        int $start,
-        int $end,
-        array $pathBases,
-        array $dateIds,
-        int $outputSize,
-    ): string {
-        $counts = str_repeat("\0", $outputSize);
-        $inc = [];
-        for ($i = 0; $i < 255; $i++) {
-            $inc[chr($i)] = chr($i + 1);
-        }
-
-        $handle = fopen($inputPath, 'rb');
-        stream_set_read_buffer($handle, 0);
-        fseek($handle, $start);
-
-        $remaining = $end - $start;
-
-        while ($remaining > 0) {
-            $chunk = fread($handle, $remaining > 33_554_432 ? 33_554_432 : $remaining);
-            $chunkLen = strlen($chunk);
-            $remaining -= $chunkLen;
-
-            $lastNl = strrpos($chunk, "\n");
-            if ($lastNl < ($chunkLen - 1)) {
-                $excess = $chunkLen - $lastNl - 1;
-                fseek($handle, -$excess, SEEK_CUR);
-                $remaining += $excess;
-            }
-
-            $p = 25;
-            $limit = $lastNl + 25;
-
-            while ($p < $limit) {
-                $c = strpos($chunk, ',', $p);
-                $idx =
-                    $pathBases[substr($chunk, $p, $c - $p)]
-                    + $dateIds[substr($chunk, $c + 4, 7)];
-                $counts[$idx] = $inc[$counts[$idx]];
-                $p = $c + 52;
-            }
-        }
-
-        fclose($handle);
-
-        return $counts;
     }
 }
