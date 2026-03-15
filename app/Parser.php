@@ -1,15 +1,15 @@
 <?php
 
-declare(strict_types=1);
-
 namespace App;
 
-use function array_fill;
-use function asort;
+use function chr;
+use function chunk_split;
+use function count;
+use function min;
 use function fclose;
-use function feof;
 use function fgets;
-use function filesize;
+use function file_get_contents;
+use function file_put_contents;
 use function fopen;
 use function fread;
 use function fseek;
@@ -17,243 +17,468 @@ use function ftell;
 use function fwrite;
 use function pcntl_fork;
 use function pcntl_waitpid;
+use function sodium_add;
+use function str_repeat;
+use function str_replace;
 use function stream_set_read_buffer;
 use function stream_set_write_buffer;
 use function strlen;
 use function strpos;
 use function strrpos;
 use function substr;
+use function unlink;
 use function unpack;
 
 use const SEEK_CUR;
+use const SEEK_END;
 
-final readonly class Parser
+final class Parser
 {
-    public static function parse(string $inputPath, string $outputPath): void
+    public static function parse($inputPath, $outputPath)
     {
         gc_disable();
-        $workers = 10;
-        $fileSize = filesize($inputPath);
-        $chunkSize = (int) ($fileSize / $workers);
 
-        $safeSkip = 55;
-        if (($fileSize % 100_000_000) === 0) {
-            $safeSkip = (int) ($fileSize / 100_000_000) - 1;
-        }
-
-        $boundaries = [0];
-        $handle = fopen($inputPath, 'rb');
-        for ($i = 1; $i < $workers; $i++) {
-            fseek($handle, $i * $chunkSize);
-            fgets($handle);
-            $boundaries[] = ftell($handle);
-        }
-
-        fclose($handle);
-        $boundaries[] = $fileSize;
-        $handle = fopen($inputPath, 'rb');
-        stream_set_read_buffer($handle, 0);
-        $warmUpSize = $fileSize > 4_194_304 ? 4_194_304 : $fileSize;
-        $chunk = fread($handle, $warmUpSize);
-        fclose($handle);
-        $lastNl = strrpos($chunk, "\n");
-        $pathIds = [];
-        $paths = [];
-        $pathCount = 0;
-        $dateIds = [];
-        $dateIds7 = [];
-        $dates = [];
+        $dateStringToId = [];
+        $dateIdToString = [];
         $dateCount = 0;
-        $warmUpCounts = [];
-        $pos = 0;
-        while ($pos < $lastNl) {
-            $nlPos = strpos($chunk, "\n", $pos + $safeSkip);
-            $path = substr($chunk, $pos + 25, $nlPos - $pos - 51);
-            $pathId = $pathIds[$path] ?? $pathCount;
-
-            if ($pathId === $pathCount) {
-                $pathIds[$path] = $pathId;
-                $paths[$pathCount] = $path;
-                $pathCount++;
-            }
-
-            $date = substr($chunk, $nlPos - 25, 10);
-            $dateId = $dateIds[$date] ?? -1;
-
-            if ($dateId === -1) {
-                $dateId = $dateCount;
-                $dateIds[$date] = $dateId;
-                $dateIds7[substr($date, 3, 7)] = $dateId;
-                $dates[$dateCount] = $date;
-                $dateCount++;
-            }
-
-            $warmUpCounts[$pathId][$dateId] = ($warmUpCounts[$pathId][$dateId] ?? 0) + 1;
-            $pos = $nlPos + 1;
-        }
-
-        unset($chunk);
-        $warmUpEnd = $lastNl + 1;
-        for ($i = 0; $i < $workers; $i++) {
-            if ($boundaries[$i] < $warmUpEnd) {
-                $boundaries[$i] = $warmUpEnd;
+        for ($year = 1; $year <= 6; $year++) {
+            for ($month = 1; $month <= 12; $month++) {
+                $daysInMonth = match ($month) {
+                    2 => $year === 4 ? 29 : 28,
+                    4, 6, 9, 11 => 30,
+                    default => 31,
+                };
+                $monthString = ($month < 10 ? '0' : '') . $month;
+                $yearMonthPrefix = "$year-$monthString-";
+                for ($day = 1; $day <= $daysInMonth; $day++) {
+                    $dateKey = $yearMonthPrefix . (($day < 10 ? '0' : '') . $day);
+                    $dateStringToId[$dateKey] = $dateCount;
+                    $dateIdToString[$dateCount] = '202' . $dateKey;
+                    $dateCount++;
+                }
             }
         }
 
-        $stride = $dateCount;
-
-        $pathBases = [];
-        foreach ($pathIds as $path => $id) {
-            $pathBases[$path] = $id * $stride;
+        $nextChar = [];
+        for ($i = 0; $i < 255; $i++) {
+            $nextChar[chr($i)] = chr($i + 1);
         }
 
-        $fast = [];
-        $conflict = [];
-        foreach ($pathBases as $slug => $base) {
-            $l = strlen($slug);
-            $f = $slug[0];
-            $la = $slug[$l - 1];
-            if (isset($conflict[$l][$f][$la])) {
-            } elseif (isset($fast[$l][$f][$la])) {
-                $conflict[$l][$f][$la] = true;
-                unset($fast[$l][$f][$la]);
+        $fileHandle = fopen($inputPath, 'rb');
+        stream_set_read_buffer($fileHandle, 0);
+        $headerData = fread($fileHandle, 181_000);
+
+        $slugPaths = [];
+        $slugLookup = [];
+        $slugCount = 0;
+        $position = 0;
+        $lastNewline = strrpos($headerData, "\n") ?: 0;
+
+        $slugNewlines = [];
+        while ($position < $lastNewline && $slugCount < 268) {
+            $newlinePos = strpos($headerData, "\n", $position + 52);
+            if ($newlinePos === false) break;
+            $slug = substr($headerData, $position + 25, $newlinePos - $position - 51);
+            if (!isset($slugLookup[$slug])) {
+                $slugPaths[$slugCount] = $slug;
+                $slugNewlines[$slugCount] = $newlinePos;
+                $slugLookup[$slug] = $slugCount * $dateCount;
+                $slugCount++;
+            }
+            $position = $newlinePos + 1;
+        }
+
+        $tailLength = 1;
+        find_unique_tail:
+        $slugLookup = [];
+        for ($s = 0; $s < $slugCount; $s++) {
+            $tailKey = substr($headerData, $slugNewlines[$s] - 26 - $tailLength, $tailLength);
+            if (isset($slugLookup[$tailKey])) {
+                $tailLength++;
+                goto find_unique_tail;
+            }
+            $slugLookup[$tailKey] = true;
+        }
+
+        $baseMask = (1 << 20) - 1;
+        $maxStride = 0;
+        $slugLookup = [];
+        for ($s = 0; $s < $slugCount; $s++) {
+            $stride = strlen($slugPaths[$s]) + 52;
+            if ($stride > $maxStride) {
+                $maxStride = $stride;
+            }
+            $tailKey = substr($headerData, $slugNewlines[$s] - 26 - $tailLength, $tailLength);
+            $slugLookup[$tailKey] = ($stride << 20) | ($s * $dateCount);
+        }
+
+        unset($headerData, $slugNewlines);
+        $tailOffset = 26 + $tailLength;
+        $unrollFence = ($maxStride * 18) + $tailOffset;
+
+        $outputSize = $slugCount * $dateCount;
+
+        fseek($fileHandle, 0, SEEK_END);
+        $fileSize = ftell($fileHandle);
+        fclose($fileHandle);
+
+        $grainSize = 8 * 1024 * 1024;
+        $grains = [];
+        $offset = 0;
+        $fileHandle = fopen($inputPath, 'rb');
+        stream_set_read_buffer($fileHandle, 0);
+        while ($offset < $fileSize) {
+            $end = $offset + $grainSize;
+            if ($end < $fileSize) {
+                fseek($fileHandle, $end);
+                fgets($fileHandle);
+                $end = ftell($fileHandle);
             } else {
-                $fast[$l][$f][$la] = $base;
+                $end = $fileSize;
             }
+            $grains[] = [$offset, $end];
+            $offset = $end;
         }
-        unset($conflict);
+        fclose($fileHandle);
 
-        $total = $pathCount * $stride;
-        $outputSize = $total;
-
-        $counts = array_fill(0, $total, 0);
-        foreach ($warmUpCounts as $pId => $dateCounts) {
-            $base = $pId * $stride;
-            foreach ($dateCounts as $dId => $count) {
-                $counts[$base + $dId] = $count;
-            }
-        }
-        unset($warmUpCounts);
-
-        $sockets = [];
-        for ($w = 0; $w < $workers; $w++) {
-            $pair = stream_socket_pair(STREAM_PF_UNIX, STREAM_SOCK_STREAM, STREAM_IPPROTO_IP);
-            stream_set_chunk_size($pair[0], $outputSize);
-            stream_set_chunk_size($pair[1], $outputSize);
-            if (pcntl_fork() === 0) {
-                fclose($pair[0]);
-
-                // Inlined processChunk
-                $cnts = str_repeat("\0", $outputSize);
-                $inc = [];
-                for ($i = 0; $i < 255; $i++) {
-                    $inc[chr($i)] = chr($i + 1);
-                }
-
-                $h = fopen($inputPath, 'rb');
-                stream_set_read_buffer($h, 0);
-                fseek($h, $boundaries[$w]);
-
-                $remaining = $boundaries[$w + 1] - $boundaries[$w];
-
-                while ($remaining > 0) {
-                    $chunk = fread($h, $remaining > 33_554_432 ? 33_554_432 : $remaining);
-                    $chunkLen = strlen($chunk);
-                    $remaining -= $chunkLen;
-
-                    $lastNl = strrpos($chunk, "\n");
-                    if ($lastNl < ($chunkLen - 1)) {
-                        $excess = $chunkLen - $lastNl - 1;
-                        fseek($h, -$excess, SEEK_CUR);
-                        $remaining += $excess;
-                    }
-
-                    $p = 25;
-                    $limit = $lastNl + 25;
-
-                    while ($p < $limit) {
-                        $c = strpos($chunk, ',', $p);
-                        $idx =
-                            ($fast[$c - $p][$chunk[$p]][$chunk[$c - 1]] ?? $pathBases[substr($chunk, $p, $c - $p)])
-                            + $dateIds7[substr($chunk, $c + 4, 7)];
-                        $cnts[$idx] = $inc[$cnts[$idx]];
-                        $p = $c + 52;
-                    }
-                }
-
-                fclose($h);
-                fwrite($pair[1], $cnts);
-                exit(0);
-            }
-            fclose($pair[1]);
-            $sockets[$w] = $pair[0];
+        $workerGrains = [[], [], [], [], [], [], [], []];
+        $grainCount = count($grains);
+        for ($g = 0; $g < $grainCount; $g++) {
+            $workerGrains[$g % 8][] = $grains[$g];
         }
 
-        $socketOffsets = array_fill(0, $workers, 0);
-        $write = [];
-        $except = [];
-        while ($sockets !== []) {
-            $read = $sockets;
-            stream_select($read, $write, $except, 5);
-            foreach ($read as $key => $socket) {
-                $data = fread($socket, $outputSize);
-                $dataLen = strlen($data);
-                $offset = $socketOffsets[$key];
+        $tmpDir = '/tmp/parser_' . getmypid();
+        @mkdir($tmpDir);
 
-                $alignedLen = $dataLen & ~3;
-                if ($alignedLen > 0) {
-                    foreach (unpack('V*', substr($data, 0, $alignedLen)) as $v) {
-                        $counts[$offset] += $v & 0xFF;
-                        $counts[$offset + 1] += ($v >> 8) & 0xFF;
-                        $counts[$offset + 2] += ($v >> 16) & 0xFF;
-                        $counts[$offset + 3] += ($v >> 24) & 0xFF;
-                        $offset += 4;
-                    }
-                }
+        $workerIndex = 1;
+        fork_worker:
+        if (pcntl_fork() === 0) {
+            $countBuffer = str_repeat("\0", $outputSize);
+            $reader = fopen($inputPath, 'r');
+            stream_set_read_buffer($reader, 0);
+            $myGrains = $workerGrains[$workerIndex];
+            $myGrainCount = count($myGrains);
+            $grainIdx = 0;
 
-                for ($r = $alignedLen; $r < $dataLen; $r++) {
-                    $counts[$offset] += ord($data[$r]);
-                    $offset++;
-                }
+            next_grain_child:
+            fseek($reader, $myGrains[$grainIdx][0]);
+            $remaining = $myGrains[$grainIdx][1] - $myGrains[$grainIdx][0];
 
-                $socketOffsets[$key] = $offset;
-                if (feof($socket)) {
-                    fclose($socket);
-                    unset($sockets[$key]);
-                }
-            }
-        }
+            read_child:
+            $chunk = fread($reader, min($remaining, 163_840));
+            $chunkLength = strlen($chunk);
+            $remaining -= $chunkLength;
 
-        while (pcntl_waitpid(-1, $status) > 0) {
-        }
+            $lastNewline = strrpos($chunk, "\n");
+            if ($lastNewline === false) goto advance_grain_child;
 
-        $sortedDates = $dates;
-        asort($sortedDates);
-        $out = fopen($outputPath, 'wb');
-        stream_set_write_buffer($out, 1_048_576);
-        fwrite($out, '{');
-        $firstPath = true;
-        foreach ($paths as $pathId => $path) {
-            $pathBuffer = $firstPath ? '' : ',';
-            $firstPath = false;
-            $pathBuffer .= "\n    \"\/blog\/{$path}\": {";
-            $entries = [];
-            $base = $pathId * $stride;
-
-            foreach ($sortedDates as $dateId => $dateStr) {
-                $count = $counts[$base + $dateId];
-                if ($count === 0) {
-                    continue;
-                }
-
-                $entries[] = "        \"{$dateStr}\": {$count}";
+            $leftover = $chunkLength - $lastNewline - 1;
+            if ($leftover > 0) {
+                fseek($reader, -$leftover, SEEK_CUR);
+                $remaining += $leftover;
             }
 
-            $pathBuffer .= "\n" . implode(",\n", $entries) . "\n    }";
-            fwrite($out, $pathBuffer);
+            $cursor = $lastNewline;
+
+            if ($cursor <= $unrollFence) goto cleanup_child;
+            unrolled_child:
+            $packed = $slugLookup[substr($chunk, $cursor - $tailOffset, $tailLength)];
+            $countIndex = ($packed & $baseMask) + $dateStringToId[substr($chunk, $cursor - 22, 7)];
+            $countBuffer[$countIndex] = $nextChar[$countBuffer[$countIndex]];
+            $cursor -= $packed >> 20;
+
+            $packed = $slugLookup[substr($chunk, $cursor - $tailOffset, $tailLength)];
+            $countIndex = ($packed & $baseMask) + $dateStringToId[substr($chunk, $cursor - 22, 7)];
+            $countBuffer[$countIndex] = $nextChar[$countBuffer[$countIndex]];
+            $cursor -= $packed >> 20;
+
+            $packed = $slugLookup[substr($chunk, $cursor - $tailOffset, $tailLength)];
+            $countIndex = ($packed & $baseMask) + $dateStringToId[substr($chunk, $cursor - 22, 7)];
+            $countBuffer[$countIndex] = $nextChar[$countBuffer[$countIndex]];
+            $cursor -= $packed >> 20;
+
+            $packed = $slugLookup[substr($chunk, $cursor - $tailOffset, $tailLength)];
+            $countIndex = ($packed & $baseMask) + $dateStringToId[substr($chunk, $cursor - 22, 7)];
+            $countBuffer[$countIndex] = $nextChar[$countBuffer[$countIndex]];
+            $cursor -= $packed >> 20;
+
+            $packed = $slugLookup[substr($chunk, $cursor - $tailOffset, $tailLength)];
+            $countIndex = ($packed & $baseMask) + $dateStringToId[substr($chunk, $cursor - 22, 7)];
+            $countBuffer[$countIndex] = $nextChar[$countBuffer[$countIndex]];
+            $cursor -= $packed >> 20;
+
+            $packed = $slugLookup[substr($chunk, $cursor - $tailOffset, $tailLength)];
+            $countIndex = ($packed & $baseMask) + $dateStringToId[substr($chunk, $cursor - 22, 7)];
+            $countBuffer[$countIndex] = $nextChar[$countBuffer[$countIndex]];
+            $cursor -= $packed >> 20;
+
+            $packed = $slugLookup[substr($chunk, $cursor - $tailOffset, $tailLength)];
+            $countIndex = ($packed & $baseMask) + $dateStringToId[substr($chunk, $cursor - 22, 7)];
+            $countBuffer[$countIndex] = $nextChar[$countBuffer[$countIndex]];
+            $cursor -= $packed >> 20;
+
+            $packed = $slugLookup[substr($chunk, $cursor - $tailOffset, $tailLength)];
+            $countIndex = ($packed & $baseMask) + $dateStringToId[substr($chunk, $cursor - 22, 7)];
+            $countBuffer[$countIndex] = $nextChar[$countBuffer[$countIndex]];
+            $cursor -= $packed >> 20;
+
+            $packed = $slugLookup[substr($chunk, $cursor - $tailOffset, $tailLength)];
+            $countIndex = ($packed & $baseMask) + $dateStringToId[substr($chunk, $cursor - 22, 7)];
+            $countBuffer[$countIndex] = $nextChar[$countBuffer[$countIndex]];
+            $cursor -= $packed >> 20;
+
+            $packed = $slugLookup[substr($chunk, $cursor - $tailOffset, $tailLength)];
+            $countIndex = ($packed & $baseMask) + $dateStringToId[substr($chunk, $cursor - 22, 7)];
+            $countBuffer[$countIndex] = $nextChar[$countBuffer[$countIndex]];
+            $cursor -= $packed >> 20;
+
+            $packed = $slugLookup[substr($chunk, $cursor - $tailOffset, $tailLength)];
+            $countIndex = ($packed & $baseMask) + $dateStringToId[substr($chunk, $cursor - 22, 7)];
+            $countBuffer[$countIndex] = $nextChar[$countBuffer[$countIndex]];
+            $cursor -= $packed >> 20;
+
+            $packed = $slugLookup[substr($chunk, $cursor - $tailOffset, $tailLength)];
+            $countIndex = ($packed & $baseMask) + $dateStringToId[substr($chunk, $cursor - 22, 7)];
+            $countBuffer[$countIndex] = $nextChar[$countBuffer[$countIndex]];
+            $cursor -= $packed >> 20;
+
+            $packed = $slugLookup[substr($chunk, $cursor - $tailOffset, $tailLength)];
+            $countIndex = ($packed & $baseMask) + $dateStringToId[substr($chunk, $cursor - 22, 7)];
+            $countBuffer[$countIndex] = $nextChar[$countBuffer[$countIndex]];
+            $cursor -= $packed >> 20;
+
+            $packed = $slugLookup[substr($chunk, $cursor - $tailOffset, $tailLength)];
+            $countIndex = ($packed & $baseMask) + $dateStringToId[substr($chunk, $cursor - 22, 7)];
+            $countBuffer[$countIndex] = $nextChar[$countBuffer[$countIndex]];
+            $cursor -= $packed >> 20;
+
+            $packed = $slugLookup[substr($chunk, $cursor - $tailOffset, $tailLength)];
+            $countIndex = ($packed & $baseMask) + $dateStringToId[substr($chunk, $cursor - 22, 7)];
+            $countBuffer[$countIndex] = $nextChar[$countBuffer[$countIndex]];
+            $cursor -= $packed >> 20;
+
+            $packed = $slugLookup[substr($chunk, $cursor - $tailOffset, $tailLength)];
+            $countIndex = ($packed & $baseMask) + $dateStringToId[substr($chunk, $cursor - 22, 7)];
+            $countBuffer[$countIndex] = $nextChar[$countBuffer[$countIndex]];
+            $cursor -= $packed >> 20;
+            if ($cursor > $unrollFence) goto unrolled_child;
+
+            cleanup_child:
+            if ($cursor < $tailOffset) goto next_chunk_child;
+            $packed = $slugLookup[substr($chunk, $cursor - $tailOffset, $tailLength)];
+            $countIndex = ($packed & $baseMask) + $dateStringToId[substr($chunk, $cursor - 22, 7)];
+            $countBuffer[$countIndex] = $nextChar[$countBuffer[$countIndex]];
+            $cursor -= $packed >> 20;
+            if ($cursor >= $tailOffset) goto cleanup_child;
+
+            next_chunk_child:
+            if ($remaining > 0) goto read_child;
+
+            advance_grain_child:
+            $grainIdx++;
+            if ($grainIdx < $myGrainCount) goto next_grain_child;
+
+            fclose($reader);
+            file_put_contents($tmpDir . '/' . $workerIndex, chunk_split($countBuffer, 1, "\0"));
+            exit(0);
+        }
+        if ($workerIndex < 7) {
+            $workerIndex++;
+            goto fork_worker;
         }
 
-        fwrite($out, "\n}");
-        fclose($out);
+        $parentCounts = str_repeat("\0", $outputSize);
+        $reader = fopen($inputPath, 'r');
+        stream_set_read_buffer($reader, 0);
+        $myGrains = $workerGrains[0];
+        $myGrainCount = count($myGrains);
+        $grainIdx = 0;
+
+        next_grain_parent:
+        fseek($reader, $myGrains[$grainIdx][0]);
+        $remaining = $myGrains[$grainIdx][1] - $myGrains[$grainIdx][0];
+
+        read_parent:
+        $chunk = fread($reader, min($remaining, 163_840));
+        $chunkLength = strlen($chunk);
+        $remaining -= $chunkLength;
+
+        $lastNewline = strrpos($chunk, "\n");
+        if ($lastNewline === false) goto advance_grain_parent;
+
+        $leftover = $chunkLength - $lastNewline - 1;
+        if ($leftover > 0) {
+            fseek($reader, -$leftover, SEEK_CUR);
+            $remaining += $leftover;
+        }
+
+        $cursor = $lastNewline;
+
+        if ($cursor <= $unrollFence) goto cleanup_parent;
+        unrolled_parent:
+        $packed = $slugLookup[substr($chunk, $cursor - $tailOffset, $tailLength)];
+        $countIndex = ($packed & $baseMask) + $dateStringToId[substr($chunk, $cursor - 22, 7)];
+        $parentCounts[$countIndex] = $nextChar[$parentCounts[$countIndex]];
+        $cursor -= $packed >> 20;
+
+        $packed = $slugLookup[substr($chunk, $cursor - $tailOffset, $tailLength)];
+        $countIndex = ($packed & $baseMask) + $dateStringToId[substr($chunk, $cursor - 22, 7)];
+        $parentCounts[$countIndex] = $nextChar[$parentCounts[$countIndex]];
+        $cursor -= $packed >> 20;
+
+        $packed = $slugLookup[substr($chunk, $cursor - $tailOffset, $tailLength)];
+        $countIndex = ($packed & $baseMask) + $dateStringToId[substr($chunk, $cursor - 22, 7)];
+        $parentCounts[$countIndex] = $nextChar[$parentCounts[$countIndex]];
+        $cursor -= $packed >> 20;
+
+        $packed = $slugLookup[substr($chunk, $cursor - $tailOffset, $tailLength)];
+        $countIndex = ($packed & $baseMask) + $dateStringToId[substr($chunk, $cursor - 22, 7)];
+        $parentCounts[$countIndex] = $nextChar[$parentCounts[$countIndex]];
+        $cursor -= $packed >> 20;
+
+        $packed = $slugLookup[substr($chunk, $cursor - $tailOffset, $tailLength)];
+        $countIndex = ($packed & $baseMask) + $dateStringToId[substr($chunk, $cursor - 22, 7)];
+        $parentCounts[$countIndex] = $nextChar[$parentCounts[$countIndex]];
+        $cursor -= $packed >> 20;
+
+        $packed = $slugLookup[substr($chunk, $cursor - $tailOffset, $tailLength)];
+        $countIndex = ($packed & $baseMask) + $dateStringToId[substr($chunk, $cursor - 22, 7)];
+        $parentCounts[$countIndex] = $nextChar[$parentCounts[$countIndex]];
+        $cursor -= $packed >> 20;
+
+        $packed = $slugLookup[substr($chunk, $cursor - $tailOffset, $tailLength)];
+        $countIndex = ($packed & $baseMask) + $dateStringToId[substr($chunk, $cursor - 22, 7)];
+        $parentCounts[$countIndex] = $nextChar[$parentCounts[$countIndex]];
+        $cursor -= $packed >> 20;
+
+        $packed = $slugLookup[substr($chunk, $cursor - $tailOffset, $tailLength)];
+        $countIndex = ($packed & $baseMask) + $dateStringToId[substr($chunk, $cursor - 22, 7)];
+        $parentCounts[$countIndex] = $nextChar[$parentCounts[$countIndex]];
+        $cursor -= $packed >> 20;
+
+        $packed = $slugLookup[substr($chunk, $cursor - $tailOffset, $tailLength)];
+        $countIndex = ($packed & $baseMask) + $dateStringToId[substr($chunk, $cursor - 22, 7)];
+        $parentCounts[$countIndex] = $nextChar[$parentCounts[$countIndex]];
+        $cursor -= $packed >> 20;
+
+        $packed = $slugLookup[substr($chunk, $cursor - $tailOffset, $tailLength)];
+        $countIndex = ($packed & $baseMask) + $dateStringToId[substr($chunk, $cursor - 22, 7)];
+        $parentCounts[$countIndex] = $nextChar[$parentCounts[$countIndex]];
+        $cursor -= $packed >> 20;
+
+        $packed = $slugLookup[substr($chunk, $cursor - $tailOffset, $tailLength)];
+        $countIndex = ($packed & $baseMask) + $dateStringToId[substr($chunk, $cursor - 22, 7)];
+        $parentCounts[$countIndex] = $nextChar[$parentCounts[$countIndex]];
+        $cursor -= $packed >> 20;
+
+        $packed = $slugLookup[substr($chunk, $cursor - $tailOffset, $tailLength)];
+        $countIndex = ($packed & $baseMask) + $dateStringToId[substr($chunk, $cursor - 22, 7)];
+        $parentCounts[$countIndex] = $nextChar[$parentCounts[$countIndex]];
+        $cursor -= $packed >> 20;
+
+        $packed = $slugLookup[substr($chunk, $cursor - $tailOffset, $tailLength)];
+        $countIndex = ($packed & $baseMask) + $dateStringToId[substr($chunk, $cursor - 22, 7)];
+        $parentCounts[$countIndex] = $nextChar[$parentCounts[$countIndex]];
+        $cursor -= $packed >> 20;
+
+        $packed = $slugLookup[substr($chunk, $cursor - $tailOffset, $tailLength)];
+        $countIndex = ($packed & $baseMask) + $dateStringToId[substr($chunk, $cursor - 22, 7)];
+        $parentCounts[$countIndex] = $nextChar[$parentCounts[$countIndex]];
+        $cursor -= $packed >> 20;
+
+        $packed = $slugLookup[substr($chunk, $cursor - $tailOffset, $tailLength)];
+        $countIndex = ($packed & $baseMask) + $dateStringToId[substr($chunk, $cursor - 22, 7)];
+        $parentCounts[$countIndex] = $nextChar[$parentCounts[$countIndex]];
+        $cursor -= $packed >> 20;
+
+        $packed = $slugLookup[substr($chunk, $cursor - $tailOffset, $tailLength)];
+        $countIndex = ($packed & $baseMask) + $dateStringToId[substr($chunk, $cursor - 22, 7)];
+        $parentCounts[$countIndex] = $nextChar[$parentCounts[$countIndex]];
+        $cursor -= $packed >> 20;
+        if ($cursor > $unrollFence) goto unrolled_parent;
+
+        cleanup_parent:
+        if ($cursor < $tailOffset) goto next_chunk_parent;
+        $packed = $slugLookup[substr($chunk, $cursor - $tailOffset, $tailLength)];
+        $countIndex = ($packed & $baseMask) + $dateStringToId[substr($chunk, $cursor - 22, 7)];
+        $parentCounts[$countIndex] = $nextChar[$parentCounts[$countIndex]];
+        $cursor -= $packed >> 20;
+        if ($cursor >= $tailOffset) goto cleanup_parent;
+
+        next_chunk_parent:
+        if ($remaining > 0) goto read_parent;
+
+        advance_grain_parent:
+        $grainIdx++;
+        if ($grainIdx < $myGrainCount) goto next_grain_parent;
+
+        fclose($reader);
+
+        while (pcntl_waitpid(-1, $status) > 0) {}
+
+        $merged = chunk_split($parentCounts, 1, "\0");
+        unset($parentCounts);
+
+        $workerIndex = 1;
+        merge_results:
+        sodium_add($merged, file_get_contents($tmpDir . '/' . $workerIndex));
+        unlink($tmpDir . '/' . $workerIndex);
+        if ($workerIndex < 7) {
+            $workerIndex++;
+            goto merge_results;
+        }
+        @rmdir($tmpDir);
+
+        $counts = unpack('v*', $merged);
+        $outputHandle = fopen($outputPath, 'w');
+        stream_set_write_buffer($outputHandle, 1_048_576);
+        fwrite($outputHandle, '{');
+
+        $datePrefixes = [];
+        for ($d = 0; $d < $dateCount; $d++) {
+            $datePrefixes[$d] = '        "' . $dateIdToString[$d] . '": ';
+        }
+
+        $escapedPaths = [];
+        for ($s = 0; $s < $slugCount; $s++) {
+            $escapedPaths[$s] = '"\/blog\/' . str_replace('/', '\/', $slugPaths[$s]) . '": {';
+        }
+
+        $separator = "\n    ";
+        $baseIndex = 1;
+
+        for ($s = 0; $s < $slugCount; $s++) {
+            $firstDate = -1;
+            $countIndex = $baseIndex;
+            for ($d = 0; $d < $dateCount; $d++) {
+                if ($counts[$countIndex] !== 0) {
+                    $firstDate = $d;
+                    break;
+                }
+                $countIndex++;
+            }
+
+            if ($firstDate === -1) {
+                $baseIndex += $dateCount;
+                continue;
+            }
+
+            $buffer = $separator . $escapedPaths[$s] . "\n" . $datePrefixes[$firstDate] . $counts[$countIndex];
+            $separator = ",\n    ";
+
+            for ($d = $firstDate + 1; $d < $dateCount; $d++) {
+                $countIndex++;
+                $count = $counts[$countIndex];
+                if ($count === 0) continue;
+                $buffer .= ",\n" . $datePrefixes[$d] . $count;
+            }
+
+            $buffer .= "\n    }";
+            fwrite($outputHandle, $buffer);
+            $baseIndex += $dateCount;
+        }
+
+        fwrite($outputHandle, "\n}");
+        fclose($outputHandle);
     }
 }
